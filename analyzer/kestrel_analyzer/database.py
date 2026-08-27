@@ -452,10 +452,20 @@ def _to_csv_atomic(database: pd.DataFrame, db_path: str) -> None:
         dir=directory,
     )
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8", newline="") as f:
+        # If os.fdopen raises, it has NOT taken ownership of tmp_fd, so the
+        # descriptor would leak (and on Windows keep the temp file locked). Close
+        # it explicitly in that case; on success the with-block owns and closes it.
+        try:
+            f = os.fdopen(tmp_fd, "w", encoding="utf-8", newline="")
+        except BaseException:
+            os.close(tmp_fd)
+            raise
+        with f:
             database.to_csv(f, index=False)
+            # flush() errors (ENOSPC, EIO) must propagate: a partial temp
+            # file must not be os.replace'd over a good destination.
+            f.flush()
             try:
-                f.flush()
                 os.fsync(f.fileno())
             except OSError:
                 # fsync can legitimately fail on some network filesystems
