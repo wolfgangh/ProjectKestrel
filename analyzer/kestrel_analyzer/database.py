@@ -3,12 +3,11 @@ import os
 import shutil
 import tempfile
 import time
-from datetime import datetime
 
 import pandas as pd
 
 from .config import DATABASE_NAME, METADATA_FILENAME, SCENEDATA_FILENAME, VERSION
-from .logging_utils import log_warning
+from .logging_utils import log_warning, _utc_now_naive
 
 # Leveled console logging — kestrel_analyzer is sometimes imported standalone
 # (e.g. tests), so fall back to a no-op if settings_utils isn't reachable.
@@ -85,7 +84,7 @@ def load_database(kestrel_dir: str, analyzer_name: str, log_path: str = None):
                 metadata = {
                     "version": VERSION,
                     "analyzer": analyzer_name,
-                    "created_utc": datetime.utcnow().isoformat() + "Z",
+                    "created_utc": _utc_now_naive().isoformat() + "Z",
                     "database_file": DATABASE_NAME,
                 }
                 with open(metadata_path, "w", encoding="utf-8") as mf:
@@ -136,7 +135,7 @@ def _perform_db_upgrade(
 
     # Rename old CSV as backup, then save new one without legacy columns
     try:
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = _utc_now_naive().strftime("%Y%m%d_%H%M%S")
         old_path = os.path.join(kestrel_dir, f"OLD_kestrel_database_{timestamp}.csv")
         os.rename(db_path, old_path)
         cleaned = database.drop(
