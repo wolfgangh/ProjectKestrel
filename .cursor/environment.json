@@ -1,0 +1,4 @@
+{
+  "name": "Project Kestrel",
+  "install": "bash .cursor/install.sh"
+}
