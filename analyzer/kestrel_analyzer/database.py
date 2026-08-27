@@ -1,13 +1,13 @@
 import json
 import os
+import shutil
 import tempfile
 import time
-from datetime import datetime
 
 import pandas as pd
 
 from .config import DATABASE_NAME, METADATA_FILENAME, SCENEDATA_FILENAME, VERSION
-from .logging_utils import log_warning
+from .logging_utils import log_warning, utc_now_naive
 
 # Leveled console logging — kestrel_analyzer is sometimes imported standalone
 # (e.g. tests), so fall back to a no-op if settings_utils isn't reachable.
@@ -84,7 +84,7 @@ def load_database(kestrel_dir: str, analyzer_name: str, log_path: str = None):
                 metadata = {
                     "version": VERSION,
                     "analyzer": analyzer_name,
-                    "created_utc": datetime.utcnow().isoformat() + "Z",
+                    "created_utc": utc_now_naive().isoformat() + "Z",
                     "database_file": DATABASE_NAME,
                 }
                 with open(metadata_path, "w", encoding="utf-8") as mf:
@@ -135,7 +135,7 @@ def _perform_db_upgrade(
 
     # Rename old CSV as backup, then save new one without legacy columns
     try:
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = utc_now_naive().strftime("%Y%m%d_%H%M%S")
         old_path = os.path.join(kestrel_dir, f"OLD_kestrel_database_{timestamp}.csv")
         os.rename(db_path, old_path)
         cleaned = database.drop(
@@ -180,16 +180,27 @@ def _build_scenedata_from_legacy_db(database: pd.DataFrame) -> dict:
             filename = str(row.get("filename", ""))
             if not filename:
                 continue
-            origin = str(row.get("rating_origin", "")).lower() if has_origin else ""
+            if has_origin:
+                raw_origin = row.get("rating_origin", "")
+                # A blank field is read by pd.read_csv as NaN, so str(NaN) would
+                # be 'nan' rather than ''. Normalize NaN/None/whitespace to ''
+                # so a blank origin is treated as "no explicit origin".
+                origin = "" if pd.isna(raw_origin) else str(raw_origin).strip().lower()
+            else:
+                origin = ""
             rating_val = row.get("rating", None)
             try:
                 r = int(float(rating_val))
             except (TypeError, ValueError):
                 continue
-            # Save if explicitly manual, or if non-zero with no origin (implies user intent)
-            if origin == "manual" or (not has_origin and 1 <= r <= 5):
-                if 1 <= r <= 5:
-                    scenedata["image_ratings"][filename] = r
+            # Preserve a real 1-5 rating unless it is explicitly an auto rating.
+            # A blank origin is treated like "no origin column": a rating with no
+            # explicit 'auto' marker is assumed to be user intent, so it is not
+            # dropped during migration. (Previously, when a rating_origin column
+            # existed but was blank for a manually-rated row, the rating was
+            # silently lost.) Explicit 'auto' ratings are left for recomputation.
+            if 1 <= r <= 5 and origin in ("", "manual"):
+                scenedata["image_ratings"][filename] = r
 
     # Build scenes from scene_count grouping
     if "scene_count" in database.columns:
@@ -322,10 +333,14 @@ def load_scenedata(kestrel_dir: str) -> dict:
 
 
 def save_scenedata(scenedata: dict, kestrel_dir: str) -> None:
-    """Save scenedata dict to kestrel_scenedata.json."""
+    """Save scenedata dict to kestrel_scenedata.json.
+
+    Written atomically: scenedata holds the user's ratings, tags and Accept/
+    Reject decisions, so a partial write from a crash/power loss must never
+    truncate the existing file.
+    """
     scenedata_path = os.path.join(kestrel_dir, SCENEDATA_FILENAME)
-    with open(scenedata_path, "w", encoding="utf-8") as f:
-        json.dump(scenedata, f, indent=2)
+    write_json_atomic(scenedata_path, scenedata, indent=2)
 
 
 def ensure_columns(database: pd.DataFrame) -> pd.DataFrame:
@@ -452,10 +467,20 @@ def _to_csv_atomic(database: pd.DataFrame, db_path: str) -> None:
         dir=directory,
     )
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8", newline="") as f:
+        # If os.fdopen raises, it has NOT taken ownership of tmp_fd, so the
+        # descriptor would leak (and on Windows keep the temp file locked). Close
+        # it explicitly in that case; on success the with-block owns and closes it.
+        try:
+            f = os.fdopen(tmp_fd, "w", encoding="utf-8", newline="")
+        except BaseException:
+            os.close(tmp_fd)
+            raise
+        with f:
             database.to_csv(f, index=False)
+            # flush() errors (ENOSPC, EIO) must propagate: a partial temp
+            # file must not be os.replace'd over a good destination.
+            f.flush()
             try:
-                f.flush()
                 os.fsync(f.fileno())
             except OSError:
                 # fsync can legitimately fail on some network filesystems
@@ -471,6 +496,130 @@ def _to_csv_atomic(database: pd.DataFrame, db_path: str) -> None:
         except OSError:
             pass
         raise
+
+
+def copy_file_atomic(src_path: str, dst_path: str) -> None:
+    """Copy ``src_path`` onto ``dst_path`` atomically (temp file + os.replace).
+
+    Used by the backup-restore path: ``shutil.copy2`` writes the destination in
+    place, so an interrupted restore (this runs right after a risky operation
+    like reject-and-move, exactly when a crash is plausible) could leave the
+    live database/scenedata half-overwritten and corrupt. Copying raw bytes to a
+    temp file in the same directory and ``os.replace``-ing it in gives readers /
+    a crash an all-or-nothing view, and preserves the file's exact encoding/BOM.
+    Content is flushed+fsync'd before the replace (matching ``_to_csv_atomic``'s
+    durability), and file metadata (mode/mtime) is preserved like the previous
+    ``shutil.copy2``.
+    """
+    directory = os.path.dirname(dst_path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_fd, tmp = tempfile.mkstemp(prefix=".kestrel_atomic_", suffix=".tmp", dir=directory)
+    try:
+        # If fdopen raises it hasn't taken ownership of the descriptor; close it
+        # explicitly so it can't leak.
+        try:
+            dst_f = os.fdopen(tmp_fd, "wb")
+        except BaseException:
+            os.close(tmp_fd)
+            raise
+        # Close dst_f in a finally rather than relying on the with-statement's
+        # ordering: if opening the source (or the copy) raises, the destination
+        # handle must still be released. A leaked handle on Windows can block
+        # the os.replace below and strand the .tmp file. close() on an
+        # already-closed handle is a harmless no-op.
+        try:
+            with open(src_path, "rb") as src_f:
+                shutil.copyfileobj(src_f, dst_f)
+                dst_f.flush()
+                try:
+                    os.fsync(dst_f.fileno())
+                except OSError:
+                    # fsync can legitimately fail on some network filesystems;
+                    # the replace below still gives readers an all-or-nothing
+                    # view.
+                    pass
+        finally:
+            dst_f.close()
+        # Preserve mode/mtime as the previous shutil.copy2 did (best-effort).
+        try:
+            shutil.copystat(src_path, tmp)
+        except OSError:
+            pass
+        retry_on_file_lock(lambda: os.replace(tmp, dst_path))
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_file_atomic(path: str, write_fn, encoding: str = "utf-8") -> None:
+    """Atomically write by calling ``write_fn(file)`` on a temp file, then replace.
+
+    ``write_fn`` receives an open text file (encoding/newline already set) and
+    must write the full payload into it. Shared by ``write_text_atomic`` and
+    ``write_json_atomic``. Mirrors ``_to_csv_atomic`` / ``settings_utils.save_settings``.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_fd, tmp = tempfile.mkstemp(prefix=".kestrel_atomic_", suffix=".tmp", dir=directory)
+    try:
+        # If os.fdopen raises, it has NOT taken ownership of tmp_fd, so the
+        # descriptor would leak (and on Windows keep the temp file locked). Close
+        # it explicitly in that case; on success the with-block owns and closes it.
+        try:
+            f = os.fdopen(tmp_fd, "w", encoding=encoding, newline="")
+        except BaseException:
+            os.close(tmp_fd)
+            raise
+        with f:
+            write_fn(f)
+            # flush() errors (ENOSPC, EIO) must propagate: a partial temp
+            # file must not be os.replace'd over a good destination.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync can legitimately fail on some network filesystems; the
+                # replace below still gives readers an all-or-nothing view.
+                pass
+        retry_on_file_lock(lambda: os.replace(tmp, path))
+    except BaseException:
+        # Do NOT fall back to a direct write -- that is the partial-write path
+        # this helper exists to close. Leave the previous file intact.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_text_atomic(path: str, text: str, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically (temp file + ``os.replace``).
+
+    Plain ``open(path, "w")`` truncates the destination and streams into it, so
+    a crash/power loss mid-write leaves a partial file behind. For the UI's
+    raw-text CSV save that means a truncated database. Writing to a unique temp
+    file in the same directory and ``os.replace``-ing it into place gives
+    readers/crashes an all-or-nothing view.
+    """
+    _write_file_atomic(path, lambda f: f.write(text), encoding=encoding)
+
+
+def write_json_atomic(path: str, obj, indent: int = 2) -> None:
+    """Serialize ``obj`` to JSON at ``path`` atomically via streaming ``json.dump``.
+
+    Unlike ``write_text_atomic(json.dumps(obj))``, this never materializes the
+    full serialized string in memory -- important for large scenedata payloads
+    (ratings, tags, cull decisions).
+    """
+    def _dump(f):
+        json.dump(obj, f, indent=indent)
+
+    _write_file_atomic(path, _dump)
 
 
 def save_database(database: pd.DataFrame, db_path: str) -> None:

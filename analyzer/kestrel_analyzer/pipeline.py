@@ -43,7 +43,13 @@ from .image_utils import decode_embedded_preview, read_image, read_image_for_pip
 from .ratings import quality_to_rating, resolve_thresholds
 from .similarity import compute_image_similarity_akaze, compute_similarity_timestamp
 from .raw_exif import get_capture_time
-from .logging_utils import get_log_path, log_event, log_exception, log_warning
+from .logging_utils import (
+    get_log_path,
+    log_event,
+    log_exception,
+    log_warning,
+    make_logged_showwarning,
+)
 
 try:
     from ..settings_utils import load_persisted_settings, debug as _debug, info as _info, error as _error
@@ -268,6 +274,7 @@ class AnalysisPipeline:
         max_buffered = max_workers + 1
         semaphore = threading.Semaphore(max_buffered)
         futures_q: queue.Queue = queue.Queue()
+        stop_event = threading.Event()
 
         # Fixed cadence (every 10 images) rather than a percentage of total so
         # long runs remain observable in real time. First 3 images always
@@ -289,7 +296,14 @@ class AnalysisPipeline:
             nonlocal submitted, peak_inflight
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for raw_file in file_list:
+                    if stop_event.is_set():
+                        break
                     semaphore.acquire()
+                    if stop_event.is_set():
+                        # Consumer abandoned the generator (cancel / fatal error)
+                        # while we waited for a free buffer slot; stop submitting
+                        # so the pool can drain and shut down.
+                        break
                     future = executor.submit(
                         _decode_and_time,
                         os.path.join(folder, raw_file),
@@ -312,33 +326,44 @@ class AnalysisPipeline:
             f"buffer={max_buffered}"
         )
 
-        while True:
-            future = futures_q.get()
-            if future is None:
-                break
-            t_wait = time.monotonic()
-            decoded = future.result()
-            wait_ms = (time.monotonic() - t_wait) * 1000.0
-            with metrics_lock:
-                total_wait_ms += wait_ms
-                snap_submitted = submitted
-                snap_completed = completed
-            idx += 1
+        try:
+            while True:
+                future = futures_q.get()
+                if future is None:
+                    break
+                t_wait = time.monotonic()
+                decoded = future.result()
+                wait_ms = (time.monotonic() - t_wait) * 1000.0
+                with metrics_lock:
+                    total_wait_ms += wait_ms
+                    snap_submitted = submitted
+                    snap_completed = completed
+                idx += 1
 
-            # Print for the first 3 images (warm-up visibility), then every
-            # ~10% of the run, and always on the last image.
-            if idx <= 3 or idx % log_every_n == 0 or idx == total:
-                decode_ms = decoded.get("_decode_ms")
-                decode_ms_str = f"{decode_ms:.0f}" if decode_ms is not None else "?"
-                inflight_now = max(0, snap_submitted - snap_completed)
-                ahead = max(0, snap_submitted - idx)
-                _debug(
-                    f"[decode-queue] idx={idx}/{total} "
-                    f"inflight={inflight_now} ahead={ahead} "
-                    f"decode_ms={decode_ms_str} wait_ms={wait_ms:.0f}"
-                )
+                # Print for the first 3 images (warm-up visibility), then every
+                # ~10% of the run, and always on the last image.
+                if idx <= 3 or idx % log_every_n == 0 or idx == total:
+                    decode_ms = decoded.get("_decode_ms")
+                    decode_ms_str = f"{decode_ms:.0f}" if decode_ms is not None else "?"
+                    inflight_now = max(0, snap_submitted - snap_completed)
+                    ahead = max(0, snap_submitted - idx)
+                    _debug(
+                        f"[decode-queue] idx={idx}/{total} "
+                        f"inflight={inflight_now} ahead={ahead} "
+                        f"decode_ms={decode_ms_str} wait_ms={wait_ms:.0f}"
+                    )
 
-            yield decoded
+                yield decoded
+                semaphore.release()
+        finally:
+            # If the consumer abandons this generator early -- an outer cancel or
+            # a fatal error makes process_folder return, which raises
+            # GeneratorExit at the yield above -- the loop stops releasing the
+            # semaphore. Signal the producer to stop and free one slot so it
+            # unblocks from semaphore.acquire(), lets its ThreadPoolExecutor
+            # drain, and exits. Without this the decode-worker threads (and their
+            # buffered full-res images) leak for the rest of the process.
+            stop_event.set()
             semaphore.release()
 
         submit_thread.join()
@@ -547,21 +572,12 @@ class AnalysisPipeline:
         stage_ctx = {"stage": "startup", "file": None}
 
         original_showwarning = warnings.showwarning
-
-        def _showwarning(message, category, filename, lineno, file=None, line=None):
-            log_warning(
-                self._log_path,
-                message,
-                category=category,
-                filename=filename,
-                lineno=lineno,
-                stage=stage_ctx["stage"],
-                context={"file": stage_ctx["file"], "folder": folder},
-            )
-            if original_showwarning:
-                original_showwarning(message, category, filename, lineno, file=file, line=line)
-
-        warnings.showwarning = _showwarning
+        warnings.showwarning = make_logged_showwarning(
+            self._log_path,
+            stage_ctx,
+            folder=folder,
+            original_showwarning=original_showwarning,
+        )
 
         try:
             stage_ctx["stage"] = "list_files"
