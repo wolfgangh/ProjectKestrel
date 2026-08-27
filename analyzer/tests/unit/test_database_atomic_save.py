@@ -156,6 +156,72 @@ class TestAtomicCsvWrite:
         assert sorted(os.listdir(tmp_path)) == ["kestrel_database.csv"]
         assert len(pd.read_csv(db_path)) == len(df)
 
+    def test_flush_error_does_not_replace_existing(self, tmp_path, monkeypatch):
+        """ENOSPC on flush must not promote a partial temp over the last good file."""
+        db_path = tmp_path / "kestrel_database.csv"
+        _to_csv_atomic(_frame(10), str(db_path))
+        good = db_path.read_bytes()
+        real_fdopen = _dbmod.os.fdopen
+
+        class FlushBoom:
+            """Delegates to the real fdopen file; flush is not assignable on TextIOWrapper.
+
+            pandas ``to_csv(file)`` uses more than ``write`` (encoding, newline,
+            writelines, …), so unknown attributes forward to the real handle.
+            """
+
+            def __init__(self, real):
+                self._real = real
+
+            def flush(self):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._real.close()
+                return False
+
+        def wrapping_fdopen(*a, **k):
+            return FlushBoom(real_fdopen(*a, **k))
+
+        monkeypatch.setattr(_dbmod.os, "fdopen", wrapping_fdopen)
+        with pytest.raises(OSError):
+            _to_csv_atomic(_frame(10), str(db_path))
+        assert db_path.read_bytes() == good
+        assert [p.name for p in tmp_path.iterdir()] == ["kestrel_database.csv"]
+
+    def test_fsync_error_still_replaces(self, tmp_path, monkeypatch):
+        """Network-FS fsync failures are ignored; the flushed temp still replaces."""
+
+        def boom_fsync(_fd):
+            raise OSError(errno.EINVAL, "Operation not supported")
+
+        monkeypatch.setattr(_dbmod.os, "fsync", boom_fsync)
+        db_path = tmp_path / "kestrel_database.csv"
+        _to_csv_atomic(_frame(5), str(db_path))
+        assert db_path.exists()
+        assert len(pd.read_csv(db_path)) == 5
+
+    def test_fdopen_failure_closes_tmp_and_leaves_existing(self, tmp_path, monkeypatch):
+        """If fdopen fails, close the mkstemp fd so Windows can unlink the temp."""
+        db_path = tmp_path / "kestrel_database.csv"
+        _to_csv_atomic(_frame(10), str(db_path))
+        good = db_path.read_bytes()
+
+        def boom_fdopen(*_a, **_k):
+            raise OSError("fdopen failed")
+
+        monkeypatch.setattr(_dbmod.os, "fdopen", boom_fdopen)
+        with pytest.raises(OSError, match="fdopen failed"):
+            _to_csv_atomic(_frame(10), str(db_path))
+        assert db_path.read_bytes() == good
+        assert [p.name for p in tmp_path.iterdir()] == ["kestrel_database.csv"]
+
 
 class TestAtomicTextWrite:
     """write_text_atomic backs the UI CSV write path."""
