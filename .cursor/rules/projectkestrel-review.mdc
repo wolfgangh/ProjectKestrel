@@ -1,0 +1,17 @@
+---
+description: Project Kestrel review and PR-integration rules
+alwaysApply: true
+---
+
+Lies und befolge die Datei `AGENTS.md` im Repo-Root vollständig.
+
+Kurzfassung:
+- Desktop-App: pywebview + Vanilla JS + Python-`Api` in `analyzer/api_bridge.py`.
+- Sprache mit dem Nutzer: Deutsch. Code/Branches/PRs: Englisch.
+- Nicht raten. Nichts ändern ohne Auftrag, außer Modus A (PR-Integration).
+- Die wolfgangh-PRs #118–#130 plus Fork-#15 sind fachlich gelöst. Nicht als neue
+  Findings melden. Sie müssen oft noch integriert werden.
+- `main` ≠ `dev`. Nicht still die falsche Basis mergen.
+- Ein Branch = ein Fix + Tests. Keine Drive-bys.
+- Findings: Severity, Datei:Zeile, Repro, Impact, Fixrichtung, Test, Status.
+- Session-Start: Branch + welche PRs schon im Tree sind + angeforderten Modus A–H.
