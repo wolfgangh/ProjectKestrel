@@ -115,8 +115,8 @@ parallel installieren.
    lautet ausdrücklich „integriere die PRs“ oder „implementiere Fix X“.
 3. Keine Drive-by-Refactors, keine Repo-weiten Formats, keine Rename-Orgien.
 4. Ein Branch = ein Fix + Tests. Keine Feature-Arbeit in einem Review-Branch.
-5. `main` und `dev` sind verschiedene Baselines. Maintainer-PRs #112–#117 sitzen
-   oft auf `dev`. Die wolfgangh-Cursor-Branches sitzen auf `main`. Nicht still
+5. `main` und `dev` sind verschiedene Baselines. Neue wolfgangh-PRs gegen
+   SanjaySoniLV/ProjectKestrel zielen auf `dev`, nicht auf `main`. Nicht still
    die falsche Basis mergen.
 6. Bestehende atomare I/O-Muster wiederverwenden
    (`tempfile` + `fsync` + `os.replace`, Locks in `settings_utils.py`).
@@ -150,7 +150,7 @@ Diese Bugs sind fachlich gelöst. Nicht neu erfinden. Wenn `main` sie noch enth�
 Status „PR vorhanden, Implementierung ausstehend“ plus Nummer und Branch.
 
 Autor der Cursor-Fixes: wolfgangh.
-Upstream-Ziel: SanjaySoniLV/ProjectKestrel, Base in der Regel `main`.
+Upstream-Ziel: SanjaySoniLV/ProjectKestrel, Base immer `dev`.
 
 ### P1 Datenintegrität / Dateisystem
 
